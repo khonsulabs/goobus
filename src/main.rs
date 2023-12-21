@@ -9,6 +9,7 @@ use gooey::widgets::input::InputValue;
 use gooey::widgets::progress::Progressable;
 use gooey::widgets::slider::Slidable;
 use gooey::Run;
+use intentional::Assert;
 
 fn main() -> gooey::Result {
     let name = Dynamic::<String>::default();
@@ -109,7 +110,19 @@ fn bus_ui(bus: GooBus) -> impl MakeWidget {
         }
     });
 
+    let validations = Validations::default();
     let connect_to = Dynamic::<String>::default();
+    let connect_to_address = connect_to.map_each(|connect_to| {
+        let trimmed = connect_to.trim();
+        if trimmed.is_empty() {
+            Err(String::from("Connection address required"))
+        } else {
+            trimmed
+                .to_socket_addrs()
+                .map(|mut addrs| addrs.next().expect("at least one address"))
+                .map_err(|err| err.to_string())
+        }
+    });
 
     format!("{} listening on {}", bus.name(), bus.listening_on())
         .and(
@@ -117,12 +130,14 @@ fn bus_ui(bus: GooBus) -> impl MakeWidget {
                 .clone()
                 .into_input()
                 .placeholder("Connect To")
-                .and("+".into_button().on_click(move |()| {
-                    // TODO validation
-                    if let Ok(addr) = connect_to.take().parse() {
-                        bus.connect_to(addr);
-                    }
-                }))
+                .validation(validations.validate_result(connect_to_address.clone()))
+                .and(
+                    "+".into_button()
+                        .on_click(validations.when_valid(move |()| {
+                            let addr = connect_to_address.get().assert("validations ran");
+                            bus.connect_to(addr);
+                        })),
+                )
                 .into_rows(),
         )
         .into_rows()

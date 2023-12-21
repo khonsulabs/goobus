@@ -107,12 +107,13 @@ impl GooBus {
     }
 
     async fn listen_loop(self, listener: TcpListener) {
-        while let Ok((stream, peer_addr)) = listener.accept().await {
-            tokio::spawn(self.clone().initialize_peer(stream, peer_addr));
+        while let Ok((stream, _)) = listener.accept().await {
+            tokio::spawn(self.clone().initialize_peer(stream));
         }
     }
 
-    async fn initialize_peer(self, stream: TcpStream, peer_addr: SocketAddr) -> anyhow::Result<()> {
+    async fn initialize_peer(self, stream: TcpStream) -> anyhow::Result<()> {
+        let peer_addr = stream.peer_addr()?;
         let (peer_id, messages_receiver) = {
             let mut state = self.state();
             if state.peers.iter().any(|peer| peer.address == peer_addr) {
@@ -240,25 +241,19 @@ impl GooBus {
         Ok(())
     }
 
-    async fn connect_to_peer(self, connect_to: SocketAddr) -> anyhow::Result<()> {
-        println!("{}: Connecting to {connect_to}", self.data.name);
-
+    async fn connect_to_peer(self, connect_to: impl ToSocketAddrs) -> anyhow::Result<()> {
         let Ok(stream) = TcpStream::connect(connect_to).await else {
             return Ok(());
         };
 
-        self.initialize_peer(stream, connect_to).await
+        self.initialize_peer(stream).await
     }
 
     /// Attempt to connect to `addr` on the bus.
     ///
     /// If a connection is already established with the bus node at `addr`, the
     /// connection will not be established.
-    pub fn connect_to(&self, addr: SocketAddr) {
-        if self.state().peers.iter().any(|peer| peer.address == addr) {
-            return;
-        }
-
+    pub fn connect_to(&self, addr: impl ToSocketAddrs + Send + 'static) {
         self.data.tokio.spawn(self.clone().connect_to_peer(addr));
     }
 
