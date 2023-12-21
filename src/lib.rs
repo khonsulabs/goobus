@@ -1,3 +1,7 @@
+//! A peer-to-peer networked bus for publishing and subscribing to
+//! `Dynamic<T>`s.
+#![warn(missing_docs)]
+
 use std::any::{Any, TypeId};
 use std::collections::{HashMap, HashSet};
 use std::fmt::Debug;
@@ -8,6 +12,7 @@ use std::{io, thread};
 
 use alot::{LotId, Lots};
 use gooey::value::{CallbackHandle, Dynamic, DynamicGuard, WeakDynamic};
+use intentional::Assert;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
@@ -15,43 +20,52 @@ use tokio::net::{TcpListener, TcpStream, ToSocketAddrs};
 use tokio::runtime;
 use tokio::sync::mpsc::{self, UnboundedReceiver};
 
+/// A connection to a network bus that enables [publishing](Self::publish) and
+/// [subscribing](Self::subscribe_to) to [`Dynamic<T>`s](Dynamic).
 #[derive(Clone, Debug)]
 pub struct GooBus {
     data: Arc<GooBusData>,
 }
 
 impl GooBus {
-    pub fn new(name: impl Into<String>, bind: Option<impl ToSocketAddrs>) -> GooBus {
+    /// Returns a new bus connection that identifies itself as `name` and
+    /// listens for incoming TCP connections on `bind`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    ///
+    /// - tokio has en error initializing
+    /// - binding to `bind` results in an error
+    /// - spawning a named thread for tokio returns an error
+    pub fn new(name: impl Into<String>, bind: Option<impl ToSocketAddrs>) -> io::Result<GooBus> {
         let name = name.into();
 
         let rt = runtime::Builder::new_current_thread()
             .enable_all()
-            .build()
-            .expect("error initializing tokio");
+            .build()?;
 
         // Begin listening.
-        let bus = rt
-            .block_on(async {
-                let listener = if let Some(bind) = bind {
-                    TcpListener::bind(bind).await?
-                } else {
-                    TcpListener::bind("::1:0").await?
-                };
-                let listening_on = listener.local_addr()?;
-                println!("{name} listening on {listening_on}");
-                let bus = GooBus {
-                    data: Arc::new(GooBusData {
-                        name,
-                        listening_on,
-                        tokio: rt.handle().clone(),
-                        state: Dynamic::default(),
-                    }),
-                };
-                rt.spawn(bus.clone().listen_loop(listener));
+        let bus = rt.block_on(async {
+            let listener = if let Some(bind) = bind {
+                TcpListener::bind(bind).await?
+            } else {
+                TcpListener::bind("::1:0").await?
+            };
+            let listening_on = listener.local_addr()?;
+            println!("{name} listening on {listening_on}");
+            let bus = GooBus {
+                data: Arc::new(GooBusData {
+                    name,
+                    listening_on,
+                    tokio: rt.handle().clone(),
+                    state: Dynamic::default(),
+                }),
+            };
+            rt.spawn(bus.clone().listen_loop(listener));
 
-                Ok::<_, io::Error>(bus)
-            })
-            .expect("error binding tcp socket");
+            Ok::<_, io::Error>(bus)
+        })?;
 
         // Move the tokio runtime to its own thread to continue processing
         // networking.
@@ -63,28 +77,32 @@ impl GooBus {
                         tokio::time::sleep(Duration::from_secs(60 * 60 * 24)).await;
                     }
                 });
-            })
-            .expect("error spawning network thread");
+            })?;
 
-        bus
+        Ok(bus)
     }
 
+    /// Returns the name of this connection.
+    #[must_use]
     pub fn name(&self) -> &str {
         &self.data.name
     }
 
+    /// Returns the local address of the listening socket.
+    #[must_use]
     pub fn listening_on(&self) -> SocketAddr {
         self.data.listening_on
     }
 
+    /// Invokes `changed` each time the [`GooBusState`] has been updated.
     pub fn on_state_change<F>(&self, changed: F) -> CallbackHandle
     where
-        F: for<'a> FnMut(&'a GooBuState) + Send + 'static,
+        F: for<'a> FnMut(&'a GooBusState) + Send + 'static,
     {
         self.data.state.for_each(changed)
     }
 
-    fn state(&self) -> DynamicGuard<'_, GooBuState> {
+    fn state(&self) -> DynamicGuard<'_, GooBusState> {
         self.data.state.lock()
     }
 
@@ -232,6 +250,10 @@ impl GooBus {
         self.initialize_peer(stream, connect_to).await
     }
 
+    /// Attempt to connect to `addr` on the bus.
+    ///
+    /// If a connection is already established with the bus node at `addr`, the
+    /// connection will not be established.
     pub fn connect_to(&self, addr: SocketAddr) {
         if self.state().peers.iter().any(|peer| peer.address == addr) {
             return;
@@ -240,6 +262,16 @@ impl GooBus {
         self.data.tokio.spawn(self.clone().connect_to_peer(addr));
     }
 
+    /// Subscribes to a [`Dynamic<T>`] with a given `name` from a `peer` on the
+    /// bus.
+    ///
+    /// If a peer with that name is already connected, a subscription request is
+    /// made immediately. When a new peer connects with the given peer name, a
+    /// subscription will be requested.
+    ///
+    /// The returned `Dynamic` will automatically be reconnected if the peer
+    /// disconnects and reconnects.
+    #[must_use]
     pub fn subscribe_to<T>(&self, peer: &str, name: &str) -> Dynamic<T>
     where
         T: Default + Debug + DeserializeOwned + Send + PartialEq + 'static,
@@ -284,18 +316,23 @@ impl GooBus {
                         }
                     })
                     // TODO this handle should probably belong to a wrapper
-                    // returned from this function
+                    // returned from this function, or we need to make
+                    // set_source public.
                     .persist();
 
                 Box::new(deserialized)
             })
             .as_any()
             .downcast_ref::<Dynamic<T>>()
-            .expect("type mismatch")
+            .assert("type mismatch")
             .clone()
     }
 
-    pub fn register<T>(&self, name: impl Into<String>, value: &Dynamic<T>)
+    /// Publishes `value` as `name` on the bus.
+    ///
+    /// Any bus nodes will be able to subscribe to and observe this value's
+    /// changes.
+    pub fn publish<T>(&self, name: impl Into<String>, value: &Dynamic<T>)
     where
         T: Serialize + Send + 'static,
     {
@@ -346,7 +383,7 @@ struct GooBusData {
     name: String,
     listening_on: SocketAddr,
     tokio: runtime::Handle,
-    state: Dynamic<GooBuState>,
+    state: Dynamic<GooBusState>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -434,14 +471,16 @@ where
     }
 }
 
+/// The internal state of a [`GooBus`] connection.
 #[derive(Debug, Default)]
-pub struct GooBuState {
+pub struct GooBusState {
     peers: Lots<Peer>,
     values: HashMap<String, GooValue>,
     subscribing_to: HashMap<String, SubscribingToByName>,
 }
 
-impl GooBuState {
+impl GooBusState {
+    /// Returns an iterator over all of the connected peers.
     pub fn peers(&self) -> impl Iterator<Item = &PeerInfo> {
         self.peers.iter().filter_map(|peer| peer.info.as_ref())
     }
@@ -461,18 +500,21 @@ struct Peer {
     subscriptions: HashSet<Filter>,
 }
 
+/// Information about a peer of a [`GooBus`] connection.
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
 pub struct PeerInfo {
+    /// The name of the peer.
     pub name: String,
+    /// The address the peer accepts connections on.
     pub public_addr: SocketAddr,
 }
 
 #[test]
 fn value_observing() {
-    let a = GooBus::new("a", None::<SocketAddr>);
+    let a = GooBus::new("a", None::<SocketAddr>).unwrap();
     let a_value = Dynamic::new(1_i32);
-    a.register("value", &a_value);
-    let b = GooBus::new("b", None::<SocketAddr>);
+    a.publish("value", &a_value);
+    let b = GooBus::new("b", None::<SocketAddr>).unwrap();
     a.connect_to(b.data.listening_on);
     let mut b_observing_a = b.subscribe_to::<i32>("a", "value").into_reader();
 
@@ -486,7 +528,7 @@ fn value_observing() {
     b_observing_a.block_until_updated();
     assert_eq!(b_observing_a.get(), 2);
 
-    let c = GooBus::new("c", None::<SocketAddr>);
+    let c = GooBus::new("c", None::<SocketAddr>).unwrap();
     c.connect_to(a.data.listening_on);
 
     let mut c_observing_a = c.subscribe_to::<i32>("a", "value").into_reader();

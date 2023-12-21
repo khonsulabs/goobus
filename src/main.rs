@@ -1,7 +1,8 @@
-use std::fmt::Debug;
+use std::io;
 use std::net::ToSocketAddrs as _;
 
 use goobus::GooBus;
+use gooey::styles::components::{ErrorColor, TextColor};
 use gooey::value::{Dynamic, Switchable, Validations};
 use gooey::widget::{Children, MakeWidget};
 use gooey::widgets::input::InputValue;
@@ -9,33 +10,32 @@ use gooey::widgets::progress::Progressable;
 use gooey::widgets::slider::Slidable;
 use gooey::Run;
 
-#[derive(Debug, PartialEq, Eq)]
-struct Config {
-    name: String,
-    listen_on: String,
-}
-
 fn main() -> gooey::Result {
-    let config = Dynamic::new(None::<Config>);
+    let name = Dynamic::<String>::default();
+    let listen_on = Dynamic::from("[::1]:0");
+    let run = Dynamic::new(false);
 
-    config
-        .switcher(|config, dynamic| {
-            if let Some(config) = config {
-                let bus = GooBus::new(&config.name, Some(&config.listen_on));
-
-                bus_ui(bus).make_widget()
-            } else {
-                startup_ui(dynamic).make_widget()
+    run.switcher(move |run, run_dynamic| {
+        if *run {
+            match GooBus::new(name.get(), Some(listen_on.get())) {
+                Ok(bus) => bus_ui(bus).make_widget(),
+                Err(err) => error_launching(&err, run_dynamic).make_widget(),
             }
-        })
-        .centered()
-        .run()
+        } else {
+            startup_ui(&name, &listen_on, run_dynamic).make_widget()
+        }
+    })
+    .centered()
+    .run()
 }
 
-fn startup_ui(config: &Dynamic<Option<Config>>) -> impl MakeWidget {
-    let name = Dynamic::<String>::default();
-    let listen_on = Dynamic::from("::1:0");
+fn startup_ui(
+    name: &Dynamic<String>,
+    listen_on: &Dynamic<String>,
+    run: &Dynamic<bool>,
+) -> impl MakeWidget {
     let validations = Validations::default();
+    let run = run.clone();
 
     "Node Name:"
         .and(name.clone().into_input())
@@ -44,7 +44,7 @@ fn startup_ui(config: &Dynamic<Option<Config>>) -> impl MakeWidget {
             listen_on
                 .clone()
                 .into_input()
-                .validation(validations.validate(&listen_on, |listen_on| {
+                .validation(validations.validate(listen_on, |listen_on| {
                     listen_on
                         .to_socket_addrs()
                         .map(|_| ())
@@ -55,14 +55,8 @@ fn startup_ui(config: &Dynamic<Option<Config>>) -> impl MakeWidget {
             "Start"
                 .into_button()
                 .on_click(validations.when_valid({
-                    let config = config.clone();
-                    let name = name.clone();
-                    let listen_on = listen_on.clone();
                     move |()| {
-                        config.set(Some(Config {
-                            name: name.get(),
-                            listen_on: listen_on.get(),
-                        }));
+                        run.set(true);
                     }
                 }))
                 .into_default(),
@@ -72,8 +66,10 @@ fn startup_ui(config: &Dynamic<Option<Config>>) -> impl MakeWidget {
 
 fn bus_ui(bus: GooBus) -> impl MakeWidget {
     let my_value = Dynamic::new(0_u8);
-    bus.register("value", &my_value);
+    bus.publish("value", &my_value);
 
+    // Gather the list of peer names. This callback happens while the bus state
+    // is locked, preventing us from adding subscriptions.
     let connected_peers = Dynamic::<Vec<String>>::default();
     bus.on_state_change({
         let connected_peers = connected_peers.clone();
@@ -88,6 +84,7 @@ fn bus_ui(bus: GooBus) -> impl MakeWidget {
                 }
             }
 
+            // If we have any peers left, they've been disconnected.
             if max_index + 1 < connected_peers.len() {
                 connected_peers.truncate(max_index + 1);
             }
@@ -95,6 +92,8 @@ fn bus_ui(bus: GooBus) -> impl MakeWidget {
     })
     .persist();
 
+    // Create a slider for each connected peer, subscribing to their value on
+    // the bus.
     let peers = connected_peers.map_each({
         let bus = bus.clone();
         move |peer_names| {
@@ -135,4 +134,12 @@ fn bus_ui(bus: GooBus) -> impl MakeWidget {
                 .expand(),
         )
         .into_columns()
+}
+
+fn error_launching(error: &io::Error, run: &Dynamic<bool>) -> impl MakeWidget {
+    let run = run.clone();
+    "Error starting the network bus:"
+        .and(error.to_string().with_dynamic(&TextColor, ErrorColor))
+        .and("Ok".into_button().on_click(move |()| run.set(false)))
+        .into_rows()
 }

@@ -803,6 +803,7 @@ dependencies = [
  "alot",
  "anyhow",
  "gooey",
+ "intentional",
  "pot",
  "serde",
  "serde_bytes",
