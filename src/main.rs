@@ -1,5 +1,6 @@
 use std::io;
-use std::net::ToSocketAddrs as _;
+use std::net::SocketAddr;
+use std::str::FromStr;
 
 use goobus::GooBus;
 use gooey::styles::components::{ErrorColor, TextColor};
@@ -47,7 +48,7 @@ fn startup_ui(
                 .into_input()
                 .validation(validations.validate(listen_on, |listen_on| {
                     listen_on
-                        .to_socket_addrs()
+                        .parse::<SocketAddr>()
                         .map(|_| ())
                         .map_err(|err| err.to_string())
                 })),
@@ -117,10 +118,7 @@ fn bus_ui(bus: GooBus) -> impl MakeWidget {
         if trimmed.is_empty() {
             Err(String::from("Connection address required"))
         } else {
-            trimmed
-                .to_socket_addrs()
-                .map(|mut addrs| addrs.next().expect("at least one address"))
-                .map_err(|err| err.to_string())
+            SocketAddr::from_str(trimmed).map_err(|err| err.to_string())
         }
     });
 
